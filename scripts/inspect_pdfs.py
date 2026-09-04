@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-scripts/inspect_pdfs.py
+scripts/inspect_pdfs.py — VIGIL PDF Structure Inspector
 
 CLI tool for VIGIL to inspect a directory of infrastructure project PDFs.
 Inspects document structure, text extractability, OCR necessity, table detection,
 and project identity coverage.
+
+Part of VIGIL Phase 1 — Data Ingestion & Normalization.
 """
 
 import os

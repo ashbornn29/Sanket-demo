@@ -1,0 +1,105 @@
+# VIGIL Machine Learning & Backtest Configuration
+
+random_seed: 42
+
+# Explicit feature whitelist (strictly point-in-time features available at or before t)
+features:
+  numeric:
+    - V_fin_1m
+    - V_fin_3m
+    - A_fin
+    - EWMA_V_fin
+    - V_exp_1m
+    - V_exp_3m
+    - A_exp
+    - cost_revision_ratio
+    - expenditure_to_baseline
+    - schedule_deviation_months
+    - schedule_deviation_change
+    - completion_date_drift
+    - Z_peer_V_fin
+    - trajectory_risk_score
+    - V_phys_1m
+    - V_phys_3m
+    - A_phys
+    - financial_physical_gap
+    - project_age_months
+    - observation_number
+    - months_since_previous_observation
+    - reporting_gap_flag
+    - C_base
+  categorical:
+    - sector_clean
+    - scale_bucket
+
+# Target definitions
+targets:
+  primary: overrun_composite_12m
+  secondary:
+    - cost_overrun_12m
+    - schedule_overrun_12m
+
+# Baseline threshold heuristics
+baselines:
+  baseline_a_current_state:
+    expenditure_ratio_threshold: 0.90
+    schedule_deviation_months_threshold: 12.0
+  baseline_b_trajectory:
+    stalled_velocity_threshold: 0.50
+    stalled_ewma_threshold: 0.50
+    peer_z_score_threshold: -1.0
+    trajectory_risk_score_threshold: 40.0
+
+# LightGBM hyperparameters (conservative, robust against overfitting)
+lightgbm_params:
+  objective: binary
+  metric: average_precision
+  boosting_type: gbdt
+  n_estimators: 300
+  learning_rate: 0.05
+  num_leaves: 31
+  max_depth: 6
+  min_child_samples: 50
+  subsample: 0.8
+  subsample_freq: 1
+  colsample_bytree: 0.8
+  reg_alpha: 0.1
+  reg_lambda: 1.0
+  random_state: 42
+  n_jobs: -1
+  verbose: -1
+
+# Chronological walk-forward expanding window folds
+walk_forward_folds:
+  - fold_id: 1
+    train_end_month: "2018-12"
+    val_start_month: "2019-01"
+    val_end_month: "2019-12"
+    test_start_month: "2020-01"
+    test_end_month: "2020-12"
+  - fold_id: 2
+    train_end_month: "2020-12"
+    val_start_month: "2021-01"
+    val_end_month: "2021-12"
+    test_start_month: "2022-01"
+    test_end_month: "2022-12"
+  - fold_id: 3
+    train_end_month: "2022-12"
+    val_start_month: "2023-01"
+    val_end_month: "2023-06"
+    test_start_month: "2023-07"
+    test_end_month: "2024-03"
+
+# Alert policy thresholds to evaluate
+alert_thresholds:
+  - 0.30
+  - 0.40
+  - 0.50
+  - 0.60
+  - 0.70
+
+# Sensitivity analysis thresholds
+cost_sensitivity_thresholds:
+  - 0.03
+  - 0.05
+  - 0.10

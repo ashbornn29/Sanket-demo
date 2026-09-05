@@ -36,3 +36,9 @@ DATA(RAW)*
 
 # Uncompressed raw extraction log exceeding GitHub 100MB limit (compressed version .csv.gz is tracked)
 DATA/raw_extractions.csv
+
+# Local runtime databases & scratch
+*.db
+*.sqlite
+*.sqlite3
+Dashboard copy/

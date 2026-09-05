@@ -46,12 +46,15 @@ def ym_to_month_number(ym_str: Any) -> Optional[int]:
         return None
     parts = ym_str.strip().split("-")
     if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-        return int(parts[0]) * 12 + int(parts[1])
+        y, m = int(parts[0]), int(parts[1])
+        if 1 <= m <= 12:
+            return y * 12 + m
     return None
 
 def compute_trajectories(
     df: pd.DataFrame,
-    config: Optional[Dict[str, Any]] = None
+    config: Optional[Dict[str, Any]] = None,
+    peer_stats: Optional[pd.DataFrame] = None
 ) -> pd.DataFrame:
     """
     Compute point-in-time trajectory features and component risk scores.
@@ -60,7 +63,7 @@ def compute_trajectories(
     if config is None:
         config = load_config()
 
-    df = df.copy()
+    df = df.copy().reset_index(drop=True)
 
     # Ensure expected input columns exist (handling minimal test DataFrames safely)
     expected_optional_cols = [
@@ -73,8 +76,7 @@ def compute_trajectories(
             df[col] = np.nan
 
     # Ensure strictly sorted
-    if not df["project_id"].is_monotonic_increasing:
-        df = df.sort_values(by=["project_id", "reporting_month"], ascending=[True, True]).reset_index(drop=True)
+    df = df.sort_values(by=["project_id", "reporting_month"], ascending=[True, True]).reset_index(drop=True)
 
     grouped = df.groupby("project_id", sort=False)
 
@@ -209,12 +211,13 @@ def compute_trajectories(
     # Group strictly by reporting_month and sector_clean to prevent future leakage
     peer_group_cols = ["reporting_month", "sector_clean", "scale_bucket"]
     
-    # Calculate peer velocity statistics within current reporting month
-    peer_stats = df.groupby(peer_group_cols, observed=False)["V_fin_1m"].agg(
-        peer_v_mean="mean",
-        peer_v_std="std",
-        peer_count="count"
-    ).reset_index()
+    if peer_stats is None:
+        # Calculate peer velocity statistics within current reporting month
+        peer_stats = df.groupby(peer_group_cols, observed=False)["V_fin_1m"].agg(
+            peer_v_mean="mean",
+            peer_v_std="std",
+            peer_count="count"
+        ).reset_index()
 
     df = df.merge(peer_stats, on=peer_group_cols, how="left")
 
@@ -254,9 +257,10 @@ def compute_trajectories(
     )
 
     # Component 3: Burn-Rate Anomaly (expenditure ratio high relative to progress)
+    cur_fin_prog = pd.to_numeric(df["financial_progress"], errors="coerce")
     burn_ratio = np.where(
-        (fin_prog > 0) & (df["expenditure_to_baseline"] > 0),
-        df["expenditure_to_baseline"] / (fin_prog / 100.0),
+        (cur_fin_prog > 0) & (df["expenditure_to_baseline"] > 0),
+        df["expenditure_to_baseline"] / (cur_fin_prog / 100.0),
         np.nan
     )
     df["score_burn_anomaly"] = np.where(
@@ -367,3 +371,99 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     run_trajectory_pipeline(args.input, args.output, args.config)
+
+
+def compute_canonical_features_for_project(
+    observations: Any,
+    project_start_date: Optional[str] = None,
+    peer_benchmarks: Optional[pd.DataFrame] = None,
+    config: Optional[Dict[str, Any]] = None
+) -> pd.DataFrame:
+    """
+    Canonical feature-building function shared between historical inference and operational monitoring.
+    Given chronological observations for a single project through month t:
+    1. Sorts strictly by reporting_month ascending.
+    2. Computes pure timeline features:
+       - observation_number: 1-indexed sequential count (1, 2, 3...)
+       - months_since_previous_observation: calendar delta from t_{prev}
+       - reporting_gap_flag: 1 if delta > 1 month, 0 otherwise
+       - project_age_months: reporting_month - project_start_date (np.nan if start_date missing)
+    3. Computes point-in-time trajectory features via compute_trajectories.
+    4. Guarantees strict type casting and feature presence matching production model expectations.
+    """
+    if isinstance(observations, list):
+        df = pd.DataFrame(observations)
+    else:
+        df = observations.copy()
+
+    if df.empty:
+        return df
+
+    # Standardize column types
+    df = df.reset_index(drop=True)
+    df["reporting_month"] = df["reporting_month"].astype(str).str.strip()
+    df = df.sort_values(by="reporting_month", ascending=True).reset_index(drop=True)
+
+    n_obs = len(df)
+    month_indices = [ym_to_month_number(m) for m in df["reporting_month"]]
+
+    # Timeline features
+    df["observation_number"] = np.arange(1, n_obs + 1, dtype=np.int32)
+
+    months_since_prev = [np.nan]
+    for i in range(1, n_obs):
+        m_curr = month_indices[i]
+        m_prev = month_indices[i - 1]
+        if m_curr is not None and m_prev is not None:
+            months_since_prev.append(float(m_curr - m_prev))
+        else:
+            months_since_prev.append(np.nan)
+    df["months_since_previous_observation"] = pd.to_numeric(months_since_prev, errors="coerce")
+
+    df["reporting_gap_flag"] = np.where(
+        df["months_since_previous_observation"].fillna(1) > 1, 1, 0
+    ).astype(np.int32)
+
+    # Project age semantics: reporting_month - actual project_start_date
+    start_m_idx = ym_to_month_number(project_start_date) if project_start_date else None
+    if start_m_idx is not None:
+        age_list = []
+        for m_idx in month_indices:
+            if m_idx is not None:
+                age_list.append(float(m_idx - start_m_idx))
+            else:
+                age_list.append(np.nan)
+        df["project_age_months"] = pd.to_numeric(age_list, errors="coerce")
+    elif "project_age_months" in df.columns and df["project_age_months"].notna().any():
+        # Preserve if explicitly supplied in historical replay/record
+        df["project_age_months"] = pd.to_numeric(df["project_age_months"], errors="coerce")
+    else:
+        df["project_age_months"] = np.nan
+
+    # Compute trajectories using canonical engine
+    df = compute_trajectories(df, config=config, peer_stats=peer_benchmarks)
+
+    # Ensure all 25 model features are present and cast to proper types
+    numeric_model_features = [
+        'V_fin_1m', 'V_fin_3m', 'A_fin', 'EWMA_V_fin', 'V_exp_1m', 'V_exp_3m', 'A_exp',
+        'cost_revision_ratio', 'expenditure_to_baseline', 'schedule_deviation_months',
+        'schedule_deviation_change', 'completion_date_drift', 'Z_peer_V_fin',
+        'trajectory_risk_score', 'V_phys_1m', 'V_phys_3m', 'A_phys',
+        'financial_physical_gap', 'project_age_months', 'observation_number',
+        'months_since_previous_observation', 'reporting_gap_flag', 'C_base'
+    ]
+    for feat in numeric_model_features:
+        if feat not in df.columns:
+            df[feat] = np.nan
+        else:
+            df[feat] = pd.to_numeric(df[feat], errors="coerce").astype(np.float64)
+
+    cat_model_features = ['sector_clean', 'scale_bucket']
+    for cat in cat_model_features:
+        if cat not in df.columns:
+            df[cat] = "UNKNOWN"
+        else:
+            df[cat] = df[cat].fillna("UNKNOWN").astype(str)
+
+    return df
+

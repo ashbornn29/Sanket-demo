@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+"""
+vigil/api.py
+
+Production FastAPI Service for VIGIL.
+Thin REST layer exposing point-in-time inference, historical replay,
+longitudinal timelines, and portfolio governance summaries.
+
+Guarantees:
+- Strictly backed by frozen inference and replay engines
+- Point-in-time integrity preserved across all responses
+- Validated operating thresholds: WATCH=0.40, REVIEW=0.45, ESCALATE=0.50
+- Zero LLM generation: deterministic, TreeSHAP-grounded explanations
+- Strict RFC 8259 JSON output (no NaN tokens)
+"""
+
+import os
+import math
+from typing import Dict, List, Any, Optional
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from vigil.inference import load_inference_engine, get_risk_tier
+from vigil.replay import get_project_replay
+from vigil.portfolio import get_portfolio, SanitizedPortfolio, format_inr_currency
+from vigil import monitoring
+
+# Initialize FastAPI application
+app = FastAPI(
+    title="VIGIL Governance & Early Warning API",
+    description="Early-warning risk inference and historical replay service for public infrastructure projects.",
+    version="1.0.0"
+)
+
+# Global in-memory cache for fast portfolio querying
+_APP_CONTEXT: Optional[Dict[str, Any]] = None
+
+
+def sanitize_for_json(obj: Any) -> Any:
+    """
+    Recursively sanitize objects to guarantee valid RFC 8259 JSON.
+    Converts NaN, Infinity, and numpy types to Python primitives or None.
+    """
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, (np.floating, np.integer)):
+        val = obj.item()
+        if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+            return None
+        return val
+    if isinstance(obj, np.ndarray):
+        return [sanitize_for_json(x) for x in obj.tolist()]
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_for_json(v) for v in obj]
+    return obj
+
+
+def get_app_context(dataset_path: str = "DATA/model_dataset.parquet") -> Dict[str, Any]:
+    """
+    Lazily load and index the sanitized portfolio on first request.
+    Single source of truth consuming the governance-safe portfolio layer.
+    """
+    global _APP_CONTEXT
+    if _APP_CONTEXT is not None:
+        return _APP_CONTEXT
+
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"Longitudinal dataset '{dataset_path}' not found.")
+
+    portfolio = get_portfolio(dataset_path=dataset_path)
+
+    _APP_CONTEXT = {
+        "engine": portfolio.engine,
+        "portfolio": portfolio,
+        "portfolio_df": portfolio.active_projects_df,
+        "genuine_df": portfolio.genuine_projects_df,
+        "median_warning_lead_time": portfolio.historical_median_warning_lead,
+        "dataset_path": dataset_path
+    }
+    return _APP_CONTEXT
+
+
+@app.get("/health")
+def health_check() -> Dict[str, Any]:
+    """
+    Health check endpoint returning system status and model readiness.
+    """
+    ctx = get_app_context()
+    portfolio = ctx["portfolio"]
+    return {
+        "status": "healthy",
+        "service": "vigil-api",
+        "version": "1.0.0",
+        "model_loaded": ctx["engine"] is not None,
+        "total_projects_indexed": portfolio.active_project_count,
+        "active_project_count": portfolio.active_project_count,
+        "archive_entity_count": portfolio.total_archive_entities
+    }
+
+
+@app.get("/api/projects")
+def list_projects(
+    search: Optional[str] = Query(None, description="Search term for project ID or name"),
+    sector: Optional[str] = Query(None, description="Filter by sector"),
+    risk_tier: Optional[str] = Query(None, description="Filter by risk tier: WATCH, REVIEW, ESCALATE, NORMAL"),
+    limit: int = Query(50, ge=1, le=500, description="Page limit"),
+    offset: int = Query(0, ge=0, description="Page offset")
+) -> Dict[str, Any]:
+    """
+    Searchable, filterable project portfolio list returning latest state
+    for genuine infrastructure projects.
+    """
+    ctx = get_app_context()
+    df = ctx["portfolio_df"].copy()
+
+    # Filter by search - if searching specific project ID/name, also check genuine archive if not found in active
+    if search:
+        s_term = search.strip().lower()
+        id_match = df["project_id"].astype(str).str.lower().str.contains(s_term)
+        name_match = df["project_name"].astype(str).str.lower().str.contains(s_term)
+        matched_df = df[id_match | name_match]
+        if len(matched_df) == 0 and "genuine_df" in ctx:
+            g_df = ctx["genuine_df"]
+            g_id = g_df["project_id"].astype(str).str.lower().str.contains(s_term)
+            g_name = g_df["project_name"].astype(str).str.lower().str.contains(s_term)
+            matched_df = g_df[g_id | g_name].copy()
+            if "latest_risk" not in matched_df.columns:
+                matched_df["latest_risk"] = 0.0
+                matched_df["latest_risk_tier"] = "NORMAL"
+                matched_df["baseline_cost"] = pd.to_numeric(matched_df.get("C_base", 0), errors="coerce").fillna(0)
+                matched_df["sector_display"] = matched_df.get("sector_clean", "OTHER")
+        df = matched_df
+
+    # Filter by sector
+    if sector:
+        sec_term = sector.strip().lower()
+        df = df[df["sector_display"].astype(str).str.lower() == sec_term]
+
+    # Filter by risk tier
+    if risk_tier:
+        tier_term = risk_tier.strip().upper()
+        df = df[df["latest_risk_tier"] == tier_term]
+
+    total_count = len(df)
+    page_df = df.iloc[offset: offset + limit]
+
+    results = []
+    for _, r in page_df.iterrows():
+        results.append({
+            "project_id": str(r["project_id"]),
+            "project_name": str(r.get("project_name", r["project_id"])),
+            "sector": str(r.get("sector_display", "OTHER")),
+            "latest_observation": str(r.get("reporting_month", "")),
+            "latest_risk": float(r.get("latest_risk", 0.0)),
+            "latest_risk_tier": str(r.get("latest_risk_tier", "NORMAL")),
+            "baseline_cost": float(r.get("baseline_cost", 0.0))
+        })
+
+    return sanitize_for_json({
+        "total": total_count,
+        "limit": limit,
+        "offset": offset,
+        "projects": results
+    })
+
+
+@app.get("/api/projects/{project_id}")
+def get_project_details(project_id: str) -> Dict[str, Any]:
+    """
+    Retrieve project metadata, latest point-in-time prediction,
+    latest trajectory metrics, current risk tier, and top explanations.
+    """
+    ctx = get_app_context()
+    try:
+        rep = get_project_replay(project_id, dataset_path=ctx["dataset_path"], engine=ctx["engine"])
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found.")
+
+    if not rep["timeline"]:
+        raise HTTPException(status_code=404, detail=f"No timeline observations for project '{project_id}'.")
+
+    latest_rec = rep["timeline"][-1]
+
+    response = {
+        "project_id": rep["project_id"],
+        "project_name": rep["project_name"],
+        "sector": rep["sector"],
+        "ministry": rep["ministry"],
+        "state": rep["state"],
+        "approved_cost": rep["approved_cost"],
+        "total_observations": rep["total_observations"],
+        "start_month": rep["start_month"],
+        "end_month": rep["end_month"],
+        "latest_observation": latest_rec["reporting_month"],
+        "latest_prediction": {
+            "raw_prob": latest_rec["raw_prob"],
+            "pred_prob": latest_rec["pred_prob"],
+            "risk_tier": latest_rec["risk_tier"],
+            "alert": latest_rec["alert"]
+        },
+        "current_trajectory_metrics": {
+            "C_base": latest_rec["C_base"],
+            "expenditure": latest_rec["expenditure"],
+            "financial_progress": latest_rec["financial_progress"],
+            "schedule_deviation_months": latest_rec["schedule_deviation_months"],
+            "V_fin_1m": latest_rec["V_fin_1m"],
+            "V_fin_3m": latest_rec["V_fin_3m"],
+            "A_fin": latest_rec["A_fin"],
+            "EWMA_V_fin": latest_rec["EWMA_V_fin"],
+            "Z_peer_V_fin": latest_rec["Z_peer_V_fin"],
+            "trajectory_risk_score": latest_rec["trajectory_risk_score"]
+        },
+        "current_risk_tier": latest_rec["risk_tier"],
+        "top_explanations": latest_rec["top_explanations"]
+    }
+    return sanitize_for_json(response)
+
+
+@app.get("/api/projects/{project_id}/replay")
+def get_project_historical_replay(project_id: str) -> Dict[str, Any]:
+    """
+    Reconstruct full historical point-in-time replay:
+    - Monthly predictions and trajectory kinematics
+    - Historical alert points
+    - Actual deterioration milestone detection
+    - Warning lead time calculation
+    """
+    ctx = get_app_context()
+    try:
+        rep = get_project_replay(project_id, dataset_path=ctx["dataset_path"], engine=ctx["engine"])
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found.")
+
+    return sanitize_for_json(rep)
+
+
+@app.get("/api/projects/{project_id}/timeline")
+def get_project_timeline(project_id: str) -> Dict[str, Any]:
+    """
+    Return longitudinal timeline of monthly trajectory and prediction records.
+    """
+    ctx = get_app_context()
+    try:
+        rep = get_project_replay(project_id, dataset_path=ctx["dataset_path"], engine=ctx["engine"])
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found.")
+
+    return sanitize_for_json({
+        "project_id": rep["project_id"],
+        "project_name": rep["project_name"],
+        "total_observations": rep["total_observations"],
+        "timeline": rep["timeline"]
+    })
+
+
+@app.get("/api/dashboard/summary")
+def get_dashboard_summary() -> Dict[str, Any]:
+    """
+    Portfolio governance overview backed by the sanitized portfolio layer:
+    - active_project_count
+    - archive_entity_count
+    - latest_data_month
+    - active_baseline_exposure
+    - watch_count
+    - review_count
+    - escalate_count
+    - risk_weighted_exposure
+    - historical_median_warning_lead
+    """
+    ctx = get_app_context()
+    portfolio: SanitizedPortfolio = ctx["portfolio"]
+    return sanitize_for_json(portfolio.get_summary_dict())
+
+
+@app.get("/api/dashboard/interventions")
+def get_intervention_priorities(
+    limit: int = Query(30, ge=1, le=100, description="Number of priority projects to return"),
+    sector: Optional[str] = Query(None, description="Optional sector filter"),
+    min_risk_tier: Optional[str] = Query(None, description="Minimum risk tier filter: WATCH, REVIEW, ESCALATE")
+) -> Dict[str, Any]:
+    """
+    Prioritized genuine active infrastructure projects ranked by risk-weighted exposure:
+    Priority Score = Calibrated Risk × Baseline Exposure.
+    Strictly excludes macro-summary entities and historical-only projects.
+    """
+    ctx = get_app_context()
+    portfolio: SanitizedPortfolio = ctx["portfolio"]
+    return sanitize_for_json(portfolio.get_interventions(
+        limit=limit,
+        sector=sector,
+        min_risk_tier=min_risk_tier
+    ))
+
+
+# ==============================================================================
+# OPERATIONAL MONITORING LAYER ENDPOINTS (/api/monitor/...)
+# ==============================================================================
+
+class ProjectOnboardPayload(BaseModel):
+    project_id: str
+    project_name: str
+    sector: str
+    approved_cost: float
+    initial_reporting_month: str
+    ministry: Optional[str] = None
+    state: Optional[str] = None
+    revised_cost: Optional[float] = None
+    planned_start_date: Optional[str] = None
+    planned_completion_date: Optional[str] = None
+    contractor: Optional[str] = None
+    initial_metrics: Optional[Dict[str, Any]] = None
+
+
+class MonthlyObservationPayload(BaseModel):
+    reporting_month: str
+    financial_progress: Optional[float] = None
+    physical_progress: Optional[float] = None
+    expenditure: Optional[float] = None
+    revised_cost: Optional[float] = None
+    completion_date: Optional[str] = None
+    schedule_deviation_months: Optional[float] = None
+    milestone_status: Optional[str] = None
+    milestone_slippage: Optional[float] = None
+    notes: Optional[str] = None
+    supporting_documents: Optional[List[Dict[str, Any]]] = None
+
+
+class ContractorResponsePayload(BaseModel):
+    acknowledged: bool = True
+    response_text: str
+    corrective_action: str
+    expected_recovery_date: Optional[str] = None
+    responsible_person: Optional[str] = None
+    supporting_documents: Optional[List[Dict[str, Any]]] = None
+
+
+@app.post("/api/monitor/projects", status_code=201)
+def onboard_new_project(payload: ProjectOnboardPayload) -> Dict[str, Any]:
+    """
+    Onboard a newly registered project into VIGIL active monitoring.
+    Project does NOT need to exist in the historical training dataset.
+    """
+    try:
+        res = monitoring.register_project(
+            project_id=payload.project_id,
+            project_name=payload.project_name,
+            sector=payload.sector,
+            approved_cost=payload.approved_cost,
+            initial_reporting_month=payload.initial_reporting_month,
+            ministry=payload.ministry,
+            state=payload.state,
+            revised_cost=payload.revised_cost,
+            planned_start_date=payload.planned_start_date,
+            planned_completion_date=payload.planned_completion_date,
+            contractor=payload.contractor,
+            initial_metrics=payload.initial_metrics
+        )
+        return sanitize_for_json(res)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal onboarding error: {str(e)}")
+
+
+@app.get("/api/monitor/projects")
+def list_monitored_projects(
+    sector: Optional[str] = Query(None, description="Optional sector filter"),
+    status: Optional[str] = Query(None, description="Optional governance status filter"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0)
+) -> Dict[str, Any]:
+    """
+    List all actively monitored projects.
+    """
+    try:
+        res = monitoring.list_projects(sector=sector, status=status, limit=limit, offset=offset)
+        return sanitize_for_json(res)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/monitor/projects/{project_id}")
+def get_monitored_project(project_id: str) -> Dict[str, Any]:
+    """
+    Retrieve details for an actively monitored project.
+    """
+    try:
+        proj = monitoring.get_project(project_id)
+        return sanitize_for_json(proj)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/monitor/projects/{project_id}/observations", status_code=201)
+def submit_monthly_progress(project_id: str, payload: MonthlyObservationPayload) -> Dict[str, Any]:
+    """
+    Submit a monthly progress observation for a monitored project.
+    Triggers canonical feature calculation, model prediction, and governance state machine.
+    """
+    try:
+        res = monitoring.submit_observation(
+            project_id=project_id,
+            observation=payload.model_dump()
+        )
+        return sanitize_for_json(res)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process observation: {str(e)}")
+
+
+@app.get("/api/monitor/projects/{project_id}/observations")
+def list_project_observations(project_id: str) -> Dict[str, Any]:
+    """
+    List all chronological monthly progress observations for a project.
+    """
+    try:
+        obs = monitoring.get_project_observations(project_id)
+        return sanitize_for_json({"project_id": project_id, "total": len(obs), "observations": obs})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/monitor/projects/{project_id}/status")
+def get_project_governance_status(project_id: str) -> Dict[str, Any]:
+    """
+    Get current holistic governance status, active warning, and recovery state for a project.
+    """
+    try:
+        res = monitoring.get_project_status(project_id)
+        return sanitize_for_json(res)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/monitor/projects/{project_id}/warnings")
+def list_project_warnings(project_id: str) -> Dict[str, Any]:
+    """
+    List all contractor warnings issued for a project.
+    """
+    try:
+        warnings = monitoring.get_project_warnings(project_id)
+        return sanitize_for_json({"project_id": project_id, "total": len(warnings), "warnings": warnings})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/monitor/projects/{project_id}/warnings/{warning_id}/response", status_code=200)
+def submit_contractor_warning_response(
+    project_id: str,
+    warning_id: str,
+    payload: ContractorResponsePayload
+) -> Dict[str, Any]:
+    """
+    Submit a formal contractor response / recovery action plan to an active warning.
+    """
+    try:
+        res = monitoring.submit_contractor_response(
+            project_id=project_id,
+            warning_id=warning_id,
+            acknowledged=payload.acknowledged,
+            response_text=payload.response_text,
+            corrective_action=payload.corrective_action,
+            expected_recovery_date=payload.expected_recovery_date,
+            responsible_person=payload.responsible_person,
+            supporting_documents=payload.supporting_documents
+        )
+        return sanitize_for_json(res)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to submit response: {str(e)}")
+
+
+@app.get("/api/monitor/projects/{project_id}/audit")
+def get_project_audit_trail(project_id: str) -> Dict[str, Any]:
+    """
+    Retrieve immutable chronological audit trail for a monitored project.
+    """
+    try:
+        events = monitoring.get_audit_trail(project_id)
+        return sanitize_for_json({"project_id": project_id, "total": len(events), "audit_events": events})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/monitor/escalations")
+def list_authority_escalations(sector: Optional[str] = Query(None)) -> Dict[str, Any]:
+    """
+    List portfolio-wide authority escalations submitted to government oversight bodies.
+    """
+    try:
+        escalations = monitoring.get_authority_escalations(sector=sector)
+        return sanitize_for_json({"total": len(escalations), "escalations": escalations})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+

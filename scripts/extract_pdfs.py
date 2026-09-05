@@ -16,6 +16,7 @@ import re
 import argparse
 import csv
 import time
+import concurrent.futures
 from collections import defaultdict
 from typing import List, Dict, Any, Optional, Tuple
 import pymupdf
@@ -24,35 +25,57 @@ import pandas as pd
 # Import normalizers
 from normalize import (
     clean_text, extract_project_code, normalize_project_id,
-    normalize_month, normalize_progress, normalize_money, extract_multi_field
+    normalize_month, normalize_progress, normalize_money, extract_multi_field,
+    clean_sector_name
 )
 
 def detect_reporting_month(doc: pymupdf.Document, filename: str) -> Optional[str]:
-    """Detect reporting month in strict YYYY-MM format."""
+    """Detect reporting month in strict YYYY-MM format across 2000-2029."""
     full_text = ""
-    for p in range(min(5, len(doc))):
+    for p in range(min(8, len(doc))):
         full_text += doc[p].get_text() + "\n"
 
-    # Fiscal Quarter mapping
-    m_q4 = re.search(r'Q(?:PSR)?[-_ ]?4th?[_-]?QTR[_-]?(\d{4})[-_](\d{2,4})', filename, re.IGNORECASE)
+    # 1. Indian Quarter Month ranges in filename
+    # e.g. Apr-June-2015 -> Q1 (2015-06)
+    m_q_range = re.search(r'(?:Apr(?:il)?[-_ ]*Jun(?:e)?)[-_ ]*((?:19|20)\d{2})', filename, re.IGNORECASE)
+    if m_q_range:
+        return f"{m_q_range.group(1)}-06"
+        
+    m_q_range2 = re.search(r'(?:Jul(?:y)?[-_ ]*Sep(?:t|tember)?)[-_ ]*((?:19|20)\d{2})', filename, re.IGNORECASE)
+    if m_q_range2:
+        return f"{m_q_range2.group(1)}-09"
+        
+    m_q_range3 = re.search(r'(?:Oct(?:ober)?[-_ ]*Dec(?:ember)?)[-_ ]*((?:19|20)\d{2})', filename, re.IGNORECASE)
+    if m_q_range3:
+        return f"{m_q_range3.group(1)}-12"
+        
+    m_q_range4 = re.search(r'(?:Jan(?:uary)?[-_ ]*Mar(?:ch)?)[-_ ]*((?:19|20)\d{2})', filename, re.IGNORECASE)
+    if m_q_range4:
+        return f"{m_q_range4.group(1)}-03"
+
+    # 2. Fiscal Quarter patterns in filename (e.g. QPSR 4th QTR 2023-2024, QPSIR_3qtr_21-22)
+    m_q4 = re.search(r'Q(?:PSR|PISR)?[-_ ]?4th?[_-]?QTR[_-]?((?:19|20)\d{2}|\d{2})[-_](\d{2,4})', filename, re.IGNORECASE)
     if m_q4:
-        start_year = int(m_q4.group(1))
+        y_str = m_q4.group(1)
+        start_year = int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
         return f"{start_year + 1}-03"
         
-    m_q_file = re.search(r'(1st|2nd|3rd|4th)[-_ ]?Q(?:TR|PSR|PISR)[-_ ]?(\d{4})[-_](\d{2,4})', filename, re.IGNORECASE)
+    m_q_file = re.search(r'(1st|2nd|3rd|4th|\d)[-_ ]*Q(?:TR|PSR|PISR)[-_ ]*((?:19|20)\d{2}|\d{2})[-_](\d{2,4})', filename, re.IGNORECASE)
     if m_q_file:
         q_num = m_q_file.group(1).lower()
-        start_year = int(m_q_file.group(2))
-        if "1st" in q_num:
+        y_str = m_q_file.group(2)
+        start_year = int(y_str) if len(y_str) == 4 else 2000 + int(y_str)
+        if "1" in q_num:
             return f"{start_year}-06"
-        elif "2nd" in q_num:
+        elif "2" in q_num:
             return f"{start_year}-09"
-        elif "3rd" in q_num:
+        elif "3" in q_num:
             return f"{start_year}-12"
-        elif "4th" in q_num:
+        elif "4" in q_num:
             return f"{start_year + 1}-03"
 
-    m_q_text = re.search(r'(1st|2nd|3rd|4th)\s*Quarter\s*\(([^)]+)\)[,\s]+(\d{4})[-_](\d{2,4})', full_text, re.IGNORECASE)
+    # 3. Fiscal quarter mentioned in text
+    m_q_text = re.search(r'(1st|2nd|3rd|4th)\s*Quarter\s*\(([^)]+)\)[,\s]+((?:19|20)\d{2})[-_](\d{2,4})', full_text, re.IGNORECASE)
     if m_q_text:
         q_num = m_q_text.group(1).lower()
         start_year = int(m_q_text.group(3))
@@ -65,21 +88,26 @@ def detect_reporting_month(doc: pymupdf.Document, filename: str) -> Optional[str
         elif "4th" in q_num:
             return f"{start_year + 1}-03"
 
-    # Flash Report date regex
-    m_fr = re.search(r'(?:Flash\s+Report.*?|Central\s+Sector.*?Projects.*?)?(January|February|March|April|May|June|July|August|September|October|November|December)[\s,]+(202\d)', full_text, re.IGNORECASE)
+    # 4. Month + Year anywhere in filename (e.g. FR_july_Report_2019.pdf, FLR_APR_2009.pdf, FR_AUG_2001.pdf)
+    m_fn_my = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[^0-9]*((?:19|20)\d{2})', filename, re.IGNORECASE)
+    if m_fn_my:
+        norm = normalize_month(f"{m_fn_my.group(1)} {m_fn_my.group(2)}")
+        if norm:
+            return norm
+
+    # 5. Flash Report date in text (e.g. Flash Report for the month of April 2012)
+    m_fr = re.search(r'(?:Flash\s+Report.*?|Central\s+Sector.*?Projects.*?)?(January|February|March|April|May|June|July|August|September|October|November|December)[\s,]+((?:19|20)\d{2})', full_text, re.IGNORECASE)
     if m_fr:
         norm = normalize_month(f"{m_fr.group(1)} {m_fr.group(2)}")
         if norm:
             return norm
             
-    # Check filename for Month YYYY
-    m_fn = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[_-]?(\d{4})?', filename, re.IGNORECASE)
+    # 6. Check filename for just Month name (e.g. January.pdf, December.pdf)
+    m_fn = re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)', filename, re.IGNORECASE)
     if m_fn:
         m_name = m_fn.group(1)
-        year = m_fn.group(2)
-        if not year:
-            m_y = re.search(r'202\d', full_text)
-            year = m_y.group(0) if m_y else "2024"
+        m_y = re.search(r'(?:19|20)\d{2}', full_text)
+        year = m_y.group(0) if m_y else "2024"
         norm = normalize_month(f"{m_name} {year}")
         if norm:
             return norm
@@ -89,7 +117,7 @@ def detect_reporting_month(doc: pymupdf.Document, filename: str) -> Optional[str
 def classify_document(filename: str, page_count: int) -> str:
     """Classify document into one of four operational families."""
     f_lower = filename.lower()
-    if page_count <= 25 or "synopsis" in f_lower:
+    if page_count <= 25 or "synopsis" in f_lower or "(synopsis)" in f_lower:
         return "SYNOPSIS"
     elif "part-ii" in f_lower or "part-2" in f_lower or "part_ii" in f_lower:
         if "april" in f_lower or "may" in f_lower:
@@ -98,12 +126,14 @@ def classify_document(filename: str, page_count: int) -> str:
             return "CLASSIC_MASTER_TABLE"
         else:
             return "MODERN_TABLE_7"
+    elif any(k in f_lower for k in ["apr-jun", "july-sep", "oct-dec", "jan-mar", "jan-march"]):
+        return "CLASSIC_MASTER_TABLE"
     elif "qpsr" in f_lower or "qpisr" in f_lower or filename.startswith("QPSIR_1st_QTR_2022-23"):
         if "part2" in f_lower or "3rd_qtr" in f_lower or "4th_qtr" in f_lower:
             return "MODERN_TABLE_7"
         else:
             return "QPSR_CARDS"
-    elif filename.startswith("FR_") or (filename.startswith("FR") and "march" not in f_lower):
+    elif filename.startswith("FR_") or filename.startswith("MonthlyFR_") or filename.startswith("FLR_") or (filename.startswith("FR") and "march" not in f_lower):
         return "CLASSIC_MASTER_TABLE"
     else:
         return "MODERN_TABLE_7"
@@ -123,6 +153,8 @@ def clean_project_title(raw_cell: str) -> str:
     t = re.sub(r'\([Nn]?\d{8,9}\).*$', '', t).strip()
     # Strip trailing agency in parentheses e.g. (IOCL ) or (NHAI )
     t = re.sub(r'\([A-Za-z0-9\s\.\&\-]{2,20}\)\s*$', '', t).strip()
+    # Strip trailing commas, hyphens, and dashes
+    t = re.sub(r'[\s,\-]+$', '', t).strip()
     t = re.sub(r'^\s*-\s*', '', t).strip()
     return clean_text(t)
 
@@ -170,10 +202,12 @@ def extract_from_modern_table(page: pymupdf.Page, page_num: int, filename: str, 
                 
             col0 = clean_text(r[0] if len(r) > 0 else "")
             col1 = clean_text(r[1] if len(r) > 1 else "")
-            if col0 and not re.match(r'^\d+$', col0):
-                current_context["state"] = col0
-            if col1 and not re.match(r'^\d+$', col1):
-                current_context["sector"] = col1
+            s0 = clean_sector_name(col0)
+            if s0:
+                current_context["sector"] = s0
+            s1 = clean_sector_name(col1)
+            if s1:
+                current_context["sector"] = s1
                 
             sl_col = -1
             for idx, c in enumerate(r[:4]):
@@ -224,7 +258,7 @@ def extract_from_modern_table(page: pymupdf.Page, page_num: int, filename: str, 
             records.append({
                 "project_id": proj_id,
                 "project_name": proj_name,
-                "sector": current_context.get("sector", ""),
+                "sector": clean_sector_name(current_context.get("sector", "")) or "",
                 "ministry": agency,
                 "state": current_context.get("state", ""),
                 "district": "",
@@ -264,7 +298,26 @@ def extract_from_classic_table(page: pymupdf.Page, page_num: int, filename: str,
             sl_cell = str(r[0] or "").strip()
             if not re.match(r'^\d+$', sl_cell):
                 text_clean = clean_text(row_str)
-                if text_clean and len(text_clean) < 60 and not any(ch in text_clean for ch in ['/', ':', '-']):
+                # Check for continuation of previous project row (e.g. split across pages)
+                proj_cell = str(r[1] or "").strip() if len(r) > 1 else ""
+                if records and proj_cell and not any(k in proj_cell.lower() for k in ["total", "sl.no", "page", "table", "annexure", "unit", "crore"]):
+                    new_code = extract_project_code(proj_cell)
+                    m_meta = re.search(r'-\s*(?:\[.*?\]|\(.*?\))\s*,\s*([^,]+)(?:,\s*([^\n]+))?', proj_cell)
+                    if m_meta:
+                        records[-1]["ministry"] = records[-1]["ministry"] or m_meta.group(1).strip()
+                        records[-1]["state"] = records[-1]["state"] or (m_meta.group(2).strip() if m_meta.group(2) else "")
+                    elif re.search(r'\[([Nn]\d{8}|\d{9})\],([^,]+)(?:,(.*))?', proj_cell):
+                        m_tail = re.search(r'\[([Nn]\d{8}|\d{9})\],([^,]+)(?:,(.*))?', proj_cell)
+                        records[-1]["ministry"] = records[-1]["ministry"] or m_tail.group(2).strip()
+                        records[-1]["state"] = records[-1]["state"] or (m_tail.group(3).strip() if m_tail.group(3) else "")
+                    cleaned_extra = clean_project_title(proj_cell)
+                    if cleaned_extra:
+                        records[-1]["project_name"] = clean_text(records[-1]["project_name"] + " " + cleaned_extra)
+                    if new_code and records[-1]["project_id"].startswith("PRJ_"):
+                        records[-1]["project_id"] = new_code
+                elif (text_clean and len(text_clean) < 50 
+                      and not re.search(r'[\d\[\]\(\)\{\},:;/\\]', text_clean)
+                      and not any(k in text_clean.lower() for k in ["total", "sl.no", "page", "table", "annexure", "unit", "crore", "detail"])):
                     current_context["sector"] = text_clean
                 continue
                 
@@ -322,7 +375,7 @@ def extract_from_classic_table(page: pymupdf.Page, page_num: int, filename: str,
             records.append({
                 "project_id": proj_id,
                 "project_name": proj_name,
-                "sector": current_context.get("sector", ""),
+                "sector": clean_sector_name(current_context.get("sector", "")) or "",
                 "ministry": agency,
                 "state": state,
                 "district": "",
@@ -495,7 +548,7 @@ def process_pdf(filepath: str, filename: str) -> Tuple[List[Dict[str, Any]], Dic
                 page_records = []
                 
                 if category == "MODERN_TABLE_7":
-                    if any(k in p_text for k in ["Table:-7", "Table:-6", "Table-7", "Table-6", "Project List: Ongoing", "Project List:Ongoing"]):
+                    if re.search(r'(?i)\bTable\s*[:-–]?\s*[67]\b|Project\s*List\s*:\s*Ongoing', p_text):
                         page_records = extract_from_modern_table(page, p_num + 1, filename, rep_month, current_context)
                         
                 elif category == "ANNEXURE_XVIII":
@@ -506,14 +559,20 @@ def process_pdf(filepath: str, filename: str) -> Tuple[List[Dict[str, Any]], Dic
                         
                 elif category == "CLASSIC_MASTER_TABLE":
                     if not in_classic_master_table:
-                        if any(k in p_text for k in ["Detail of ongoing Projects", "Details of Ongoing Projects", "List of Projects Ahead", "List of Projects On Schedule", "List of Projects Delayed", "List of Projects Without Schedule"]):
+                        if any(k in p_text for k in [
+                            "Detail of ongoing Projects", "Details of Ongoing Projects", "List of Projects Ahead", 
+                            "List of Projects On Schedule", "List of Projects Delayed", "List of Projects Without Schedule",
+                            "Sector-Wise analysis of projects", "Sector-wise analysis of projects", "Sector-Wise Analysis of Projects",
+                            "Sector - Wise analysis of projects", "All Ongoing Projects", "Ongoing Projects", "LIST OF PROJECTS",
+                            "Appendix-1", "Appendix-I", "Appendix-VII", "List of Projects in which Expenditure",
+                            "List of projects without Date of Commissioning"
+                        ]):
                             in_classic_master_table = True
-                        elif "qpsr" in filename.lower() and p_num >= 7 and "Commissioning" in p_text:
+                        elif ("qpsr" in filename.lower() or "qpisr" in filename.lower()) and p_num >= 7 and "Commissioning" in p_text:
+                            in_classic_master_table = True
+                        elif p_num >= 30 and ("Commissioning" in p_text or "Cumulative" in p_text) and ("Cost" in p_text or "Expenditure" in p_text):
                             in_classic_master_table = True
                     if in_classic_master_table:
-                        if "Project Status with respect to" in p_text or "Annexure - I" in p_text or "Annexure  I" in p_text:
-                            in_classic_master_table = False
-                            break
                         page_records = extract_from_classic_table(page, p_num + 1, filename, rep_month, current_context)
                         
                 elif category == "QPSR_CARDS":
@@ -558,6 +617,13 @@ def process_pdf(filepath: str, filename: str) -> Tuple[List[Dict[str, Any]], Dic
         
     return records, quality, errors
 
+def worker_process_pdf(args_tuple: Tuple[int, str, str]) -> Tuple[int, str, List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]], float]:
+    idx, filename, filepath = args_tuple
+    t_f0 = time.time()
+    records, quality, errors = process_pdf(filepath, filename)
+    duration = time.time() - t_f0
+    return idx, filename, records, quality, errors, duration
+
 def main():
     parser = argparse.ArgumentParser(description="Extract infrastructure project data from PDFs for VIGIL")
     parser.add_argument("--input", "-i", default="DATA(RAW) ", help="Path to raw PDF folder")
@@ -597,16 +663,24 @@ def main():
         print("=" * 90)
 
         all_monthly_records: List[Dict[str, Any]] = []
+        file_tasks = [(idx, f, os.path.join(input_dir, f)) for idx, f in enumerate(pdf_files, 1)]
+        max_workers = min(7, os.cpu_count() or 4)
+        print(f"Parallel extraction active: utilizing {max_workers} worker processes", flush=True)
 
-        for idx, f in enumerate(pdf_files, 1):
-            path = os.path.join(input_dir, f)
-            t_f0 = time.time()
-            records, quality, errors = process_pdf(path, f)
-            all_monthly_records.extend(records)
-            all_quality_records.append(quality)
-            all_error_records.extend(errors)
-            duration = time.time() - t_f0
-            print(f"[{idx:02d}/{len(pdf_files):02d}] {f[:32]:<32} | {quality['extraction_status']:<22} | {quality['projects_detected']:<5} records | {duration:.1f}s | conf: {quality['confidence']}", flush=True)
+        completed = 0
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_to_file = {executor.submit(worker_process_pdf, t): t[1] for t in file_tasks}
+            for future in concurrent.futures.as_completed(future_to_file):
+                completed += 1
+                try:
+                    idx, f, records, quality, errors, duration = future.result()
+                    all_monthly_records.extend(records)
+                    all_quality_records.append(quality)
+                    all_error_records.extend(errors)
+                    print(f"[{completed:03d}/{len(pdf_files):03d}] {f[:32]:<32} | {quality['extraction_status']:<22} | {quality['projects_detected']:<5} records | {duration:.1f}s | conf: {quality['confidence']}", flush=True)
+                except Exception as exc:
+                    fname = future_to_file[future]
+                    print(f"[{completed:03d}/{len(pdf_files):03d}] {fname[:32]:<32} | ERROR: {exc}", flush=True)
 
         print("-" * 90)
         print("Post-processing: Writing raw extractions and aggregating canonical dataset...")

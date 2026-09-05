@@ -221,3 +221,51 @@ def extract_multi_field(cell_text: str) -> Tuple[Optional[str], Optional[str], O
             antic = l
             
     return orig, rev, antic
+
+VALID_SECTORS = {
+    "ROAD TRANSPORT AND HIGHWAYS": "Road Transport And Highways",
+    "ROAD TRANSPORT & HIGHWAYS": "Road Transport And Highways",
+    "ROADS AND HIGHWAYS": "Road Transport And Highways",
+    "ROADS & HIGHWAYS": "Road Transport And Highways",
+    "RAILWAYS": "Railways",
+    "RAILWAY": "Railways",
+    "PETROLEUM": "Petroleum",
+    "PETROLEUM AND NATURAL GAS": "Petroleum",
+    "PETROLEUM & NATURAL GAS": "Petroleum",
+    "COAL": "Coal",
+    "POWER": "Power",
+    "ATOMIC ENERGY": "Atomic Energy",
+    "CIVIL AVIATION": "Civil Aviation",
+    "MINES": "Mines",
+    "STEEL": "Steel",
+    "FERTILIZERS": "Fertilizers",
+    "SHIPPING": "Shipping and Ports",
+    "SHIPPING AND PORTS": "Shipping and Ports",
+    "PORTS AND LIGHTHOUSES": "Shipping and Ports",
+    "PORTS": "Shipping and Ports",
+    "TELECOMMUNICATIONS": "Telecommunications",
+    "TELECOM": "Telecommunications",
+    "URBAN DEVELOPMENT": "Urban Development",
+    "WATER RESOURCES": "Water Resources",
+    "HEALTH AND FAMILY WELFARE": "Health and Family Welfare",
+    "HEAVY INDUSTRY": "Heavy Industry",
+    "COMMERCE AND INDUSTRY": "Commerce and Industry",
+    "DEFENCE": "Defence",
+    "FINANCE": "Finance",
+    "TEXTILES": "Textiles"
+}
+
+def clean_sector_name(raw: Optional[str]) -> Optional[str]:
+    """Validate and normalize sector name to canonical title. Returns None if non-sector artifact."""
+    if not raw:
+        return None
+    # Strip any non-alphabet characters
+    s = re.sub(r'[^a-zA-Z\s&]', ' ', str(raw)).strip()
+    s_upper = " ".join(s.upper().split())
+    if not s_upper or len(s_upper) < 3:
+        return None
+    for k, v in VALID_SECTORS.items():
+        if k == s_upper or s_upper.startswith(k) or k in s_upper:
+            return v
+    return None
+

@@ -1,0 +1,33 @@
+# VIGIL Trajectory Engine Configuration
+
+# Core trajectory parameters
+ewma_alpha: 0.30
+min_history_for_velocity: 1
+min_history_for_acceleration: 2
+min_history_for_3m: 3
+
+# Project scale buckets (based on point-in-time C_base in Rs. Crore)
+scale_buckets:
+  small: [0, 150]
+  major: [150, 1000]
+  mega: [1000, .inf]
+
+# Project stage buckets (based on point-in-time financial progress %)
+stage_buckets:
+  early: [0, 25.0]
+  mid: [25.0, 75.0]
+  late: [75.0, .inf]
+
+# Trajectory Risk Score Component Weights (Sum = 1.0)
+# These weights govern the transparent heuristic trajectory distress score.
+# They are strictly heuristic and NOT tuned against future target labels.
+risk_score_weights:
+  stalled_velocity: 0.25         # Weight on zero or negative progress velocity
+  deceleration: 0.15             # Weight on negative progress acceleration
+  burn_rate_anomaly: 0.15        # Weight on high expenditure without progress
+  cost_revision_drift: 0.15      # Weight on baseline cost escalation
+  schedule_deterioration: 0.15   # Weight on target date slippage & delay change
+  peer_underperformance: 0.15    # Weight on negative divergence from sector cohort
+
+# Physical decoupling penalty weight (applied when physical progress is observed)
+physical_progress_weight: 0.10

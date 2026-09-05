@@ -27,3 +27,12 @@ ehthumbs.db
 *.swp
 *.swo
 *~
+.gemini/
+
+# Raw PDF reports directory (3.1GB)
+DATA(RAW)/
+DATA(RAW) /
+DATA(RAW)*
+
+# Uncompressed raw extraction log exceeding GitHub 100MB limit (compressed version .csv.gz is tracked)
+DATA/raw_extractions.csv

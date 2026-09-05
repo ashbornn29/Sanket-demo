@@ -330,6 +330,7 @@ class MonthlyObservationPayload(BaseModel):
     milestone_slippage: Optional[float] = None
     notes: Optional[str] = None
     supporting_documents: Optional[List[Dict[str, Any]]] = None
+    persistence_cycles: Optional[int] = None
 
 
 class ContractorResponsePayload(BaseModel):
@@ -501,4 +502,28 @@ def list_authority_escalations(sector: Optional[str] = Query(None)) -> Dict[str,
         return sanitize_for_json({"total": len(escalations), "escalations": escalations})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/monitor/demo/seed", status_code=200)
+def seed_demo_scenarios_endpoint(scenario: str = Query("all", pattern="^(1|2|all)$")) -> Dict[str, Any]:
+    """
+    Seed canonical deterministic VIGIL demo scenarios:
+    - scenario=1: The Contractor Recovery Workflow (5 months)
+    - scenario=2: The Authority Escalation Workflow (7 months)
+    - scenario=all: Both scenarios
+    """
+    from vigil import demo_scenarios
+    try:
+        if scenario == "1":
+            res = demo_scenarios.execute_scenario_1()
+            return sanitize_for_json({"status": "SUCCESS", "scenario_1": res})
+        elif scenario == "2":
+            res = demo_scenarios.execute_scenario_2()
+            return sanitize_for_json({"status": "SUCCESS", "scenario_2": res})
+        else:
+            res = demo_scenarios.seed_all_demo_scenarios()
+            return sanitize_for_json({"status": "SUCCESS", **res})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to seed demo scenarios: {str(e)}")
+
 

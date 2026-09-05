@@ -450,6 +450,9 @@ def submit_observation(
     pid = str(project_id).strip()
     proj = get_project(pid, db_path=db_path)
 
+    if "persistence_cycles" in observation and observation["persistence_cycles"] is not None:
+        persistence_cycles = int(observation["persistence_cycles"])
+
     m_ym = str(observation.get("reporting_month", "")).strip()
     m_idx = ym_to_month_number(m_ym)
     if m_idx is None:

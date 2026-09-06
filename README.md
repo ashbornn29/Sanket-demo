@@ -737,3 +737,9 @@ The objective is not simply to identify failed projects. The objective is to ide
 ### Project
 **VIGIL** — Infrastructure Early-Warning & Project Trajectory Intelligence System  
 *Built for intelligent, proactive infrastructure project monitoring.*
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

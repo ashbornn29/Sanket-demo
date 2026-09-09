@@ -38,17 +38,15 @@ document.addEventListener('DOMContentLoaded', () => {
       updateDashboardDOM();
 
     } catch (e) {
-      console.error('[initData] Backend unavailable:', e);
+      console.warn('[initData] Backend unavailable, falling back to mock data:', e);
       document.getElementById('connectionDot').className = 'status-dot status-amber';
-      document.getElementById('connectionText').innerHTML = 'Offline<br/>Connection Error';
+      document.getElementById('connectionText').innerHTML = 'Offline<br/>Mock Data Active';
       
       const errorOverlay = document.getElementById('errorOverlay');
-      const errorDetails = document.getElementById('errorDetails');
-      if (errorOverlay && errorDetails) {
-        errorOverlay.style.display = 'block';
-        errorDetails.textContent = `Error: ${e.message}. Attempted to connect to backend via Express proxy.`;
+      if (errorOverlay) {
+        errorOverlay.style.display = 'none';
       }
-      return; // Stop rendering mock data
+      // Continue rendering with VIGIL_DATA (mock data)
     }
 
     // Render charts (uses live data if available, else mock)

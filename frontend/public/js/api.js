@@ -3,8 +3,8 @@
    ═══════════════════════════════════════════════════════════ */
 
 const API = (() => {
-  const BASE_URL = 'https://988762a669bb31.lhr.life/api';
-  const HEALTH_URL = 'https://988762a669bb31.lhr.life/health';
+  const BASE_URL = '/api';
+  const HEALTH_URL = '/health';
 
   async function fetchJson(endpoint, options = {}) {
     const url = endpoint.startsWith('http') ? endpoint : `${BASE_URL}${endpoint}`;

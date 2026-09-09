@@ -42,3 +42,7 @@ DATA/raw_extractions.csv
 *.sqlite
 *.sqlite3
 Dashboard copy/
+
+# Node
+node_modules/
+.env

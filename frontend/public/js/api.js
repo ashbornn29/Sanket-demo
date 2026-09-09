@@ -3,9 +3,8 @@
    ═══════════════════════════════════════════════════════════ */
 
 const API = (() => {
-  const isLocalStatic = window.location.port === '5500' || window.location.port === '8080' || window.location.protocol === 'file:';
-  const BASE_URL = isLocalStatic ? 'http://localhost:3001/api' : '/api';
-  const HEALTH_URL = isLocalStatic ? 'http://localhost:3001/health' : '/health';
+  const BASE_URL = 'https://988762a669bb31.lhr.life/api';
+  const HEALTH_URL = 'https://988762a669bb31.lhr.life/health';
 
   async function fetchJson(endpoint, options = {}) {
     const url = endpoint.startsWith('http') ? endpoint : `${BASE_URL}${endpoint}`;

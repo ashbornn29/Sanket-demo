@@ -115,7 +115,7 @@ const Assistant = (() => {
 
     try {
       const context = window.VIGIL_DATA.getAssistantContext();
-      const res = await fetch('/api/assistant', {
+      const res = await fetch('https://988762a669bb31.lhr.life/api/assistant', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text.trim(), context }),
@@ -228,7 +228,7 @@ const Assistant = (() => {
         if (!key) return;
         saveKeyBtn.textContent = 'Saving...';
         try {
-          const res = await fetch('/api/assistant/key', {
+          const res = await fetch('https://988762a669bb31.lhr.life/api/assistant/key', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ apiKey: key })

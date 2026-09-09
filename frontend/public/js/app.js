@@ -46,7 +46,9 @@ document.addEventListener('DOMContentLoaded', () => {
       if (errorOverlay) {
         errorOverlay.style.display = 'none';
       }
-      // Continue rendering with VIGIL_DATA (mock data)
+      
+      // Update DOM with mock data
+      updateDashboardDOM();
     }
 
     // Render charts (uses live data if available, else mock)
